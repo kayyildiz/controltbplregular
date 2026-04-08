@@ -1,0 +1,64 @@
+
+from pathlib import Path
+from typing import Dict, Optional
+
+from . import storage
+
+
+def normalize_permissions(default_permissions: Dict[str, bool], permissions: Optional[Dict]) -> Dict[str, bool]:
+    base = dict(default_permissions)
+    if isinstance(permissions, dict):
+        for key in base:
+            if key in permissions:
+                base[key] = bool(permissions[key])
+    return base
+
+
+def verify_login(project_root: Path, username: str, password: str, default_permissions: Dict[str, bool]) -> Optional[Dict]:
+    users = storage.load_users(project_root)
+    uname = str(username).strip().lower()
+    pwd_hash = storage.sha256_text(password)
+    for user in users:
+        if str(user.get('username', '')).strip().lower() == uname and str(user.get('password_hash', '')).strip() == pwd_hash:
+            normalized = dict(user)
+            normalized['permissions'] = normalize_permissions(default_permissions, user.get('permissions'))
+            return normalized
+    return None
+
+
+def upsert_user(project_root: Path, user_payload: Dict, default_permissions: Dict[str, bool]):
+    users = storage.load_users(project_root)
+    username = str(user_payload.get('username', '')).strip()
+    if not username:
+        raise ValueError('Kullanıcı adı zorunludur.')
+    key = username.lower()
+
+    updated = False
+    new_users = []
+    for item in users:
+        item_key = str(item.get('username', '')).strip().lower()
+        if item_key == key:
+            merged = dict(item)
+            merged.update(user_payload)
+            merged['permissions'] = normalize_permissions(default_permissions, merged.get('permissions'))
+            new_users.append(merged)
+            updated = True
+        else:
+            item['permissions'] = normalize_permissions(default_permissions, item.get('permissions'))
+            new_users.append(item)
+
+    if not updated:
+        payload = dict(user_payload)
+        payload['permissions'] = normalize_permissions(default_permissions, payload.get('permissions'))
+        new_users.append(payload)
+
+    storage.save_users(project_root, new_users)
+
+
+def delete_user(project_root: Path, username: str):
+    key = str(username).strip().lower()
+    if key == 'admin':
+        raise ValueError('admin kullanıcısı silinemez.')
+    users = storage.load_users(project_root)
+    users = [u for u in users if str(u.get('username', '')).strip().lower() != key]
+    storage.save_users(project_root, users)

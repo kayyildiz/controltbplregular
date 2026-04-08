@@ -1,0 +1,421 @@
+
+from pathlib import Path
+from typing import Dict
+
+import pandas as pd
+import streamlit as st
+
+from src import auth, storage
+from src.analysis_service import (
+    dataframe_to_excel_bytes,
+    get_legacy,
+    get_muavin_field_definitions,
+    load_muavin_headers,
+    project_root,
+    run_main_analysis,
+    run_muavin_analysis,
+    run_regular_ft_analysis,
+    uploaded_file_to_df,
+)
+
+
+ROOT = project_root()
+LEGACY = get_legacy()
+DEFAULT_PERMISSIONS = dict(LEGACY.DEFAULT_SECTION_PERMISSIONS)
+
+st.set_page_config(page_title='TB & PL-CC Control', page_icon='📊', layout='wide')
+
+storage.ensure_seed_files(ROOT, DEFAULT_PERMISSIONS)
+
+
+def init_state():
+    defaults = {
+        'logged_in': False,
+        'user': None,
+        'language': 'tr',
+        'tb_df': pd.DataFrame(),
+        'plcc_df': pd.DataFrame(),
+        'tb_name': '',
+        'plcc_name': '',
+        'main_result': {},
+        'muavin_headers': {},
+        'muavin_payload': {},
+        'regular_ft_payload': {},
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def current_permissions() -> Dict[str, bool]:
+    user = st.session_state.get('user') or {}
+    raw = user.get('permissions', {})
+    perms = dict(DEFAULT_PERMISSIONS)
+    if isinstance(raw, dict):
+        perms.update({k: bool(v) for k, v in raw.items() if k in perms})
+    return perms
+
+
+def permission(key: str) -> bool:
+    return bool(current_permissions().get(key, False))
+
+
+def logout():
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
+
+
+def login_page():
+    st.title('TB & PL-CC Control · Streamlit')
+    st.caption('GitHub → Streamlit Community Cloud kurgusuna göre paketlenmiş sürüm')
+    with st.form('login_form', clear_on_submit=False):
+        username = st.text_input('Kullanıcı Adı')
+        password = st.text_input('Şifre', type='password')
+        submitted = st.form_submit_button('Giriş Yap', use_container_width=True)
+    if submitted:
+        user = auth.verify_login(ROOT, username, password, DEFAULT_PERMISSIONS)
+        if user:
+            st.session_state.logged_in = True
+            st.session_state.user = user
+            st.rerun()
+        st.error('Kullanıcı adı veya şifre hatalı.')
+
+
+def sidebar():
+    user = st.session_state.get('user') or {}
+    st.sidebar.success(f"Kullanıcı: {user.get('username', '-')}")
+    st.sidebar.caption('Not: data klasöründeki JSON kayıtları demo amaçlıdır. Cloud ortamında kalıcı veri için DB önerilir.')
+    if st.sidebar.button('Çıkış Yap', use_container_width=True):
+        logout()
+
+    menu = ['Dashboard']
+    if permission('analysis'):
+        menu.append('Analiz')
+    if permission('notes'):
+        menu.append('Not Tanımları')
+    if permission('responsibles'):
+        menu.append('Sorumlu Tayin')
+    if permission('muavin'):
+        menu.append('Muavin Analiz')
+    if permission('regular_ft'):
+        menu.append('Düzenli Gelen Ft')
+    if permission('user_management'):
+        menu.append('Kullanıcı Yönetimi')
+    return st.sidebar.radio('Menü', menu, index=0)
+
+
+def download_df_button(df: pd.DataFrame, label: str, filename: str, key: str):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    st.download_button(label, data=dataframe_to_excel_bytes(df), file_name=filename, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', key=key)
+
+
+def page_dashboard():
+    st.header('Dashboard')
+    c1, c2 = st.columns(2)
+    tb_file = c1.file_uploader('TB Dosyası', type=['xlsx', 'xls'], key='tb_file')
+    plcc_file = c2.file_uploader('PL-CC Dosyası', type=['xlsx', 'xls'], key='plcc_file')
+
+    if tb_file is not None:
+        st.session_state.tb_df = uploaded_file_to_df(tb_file)
+        st.session_state.tb_name = tb_file.name
+    if plcc_file is not None:
+        st.session_state.plcc_df = uploaded_file_to_df(plcc_file)
+        st.session_state.plcc_name = plcc_file.name
+
+    st.write({'TB': st.session_state.tb_name or '-', 'PL-CC': st.session_state.plcc_name or '-'})
+
+    preview = run_main_analysis(st.session_state.tb_df, st.session_state.plcc_df)
+    periods = [p for p in preview['adapter'].available_periods if p != LEGACY.OPENING_PERIOD_TR]
+    if not periods:
+        periods = ['02-Mart', '03-Nisan']
+
+    c1, c2 = st.columns(2)
+    current_period = c1.selectbox('Cari Dönem', periods, index=len(periods)-1, key='current_period_select')
+    previous_candidates = [p for p in periods if p != current_period] or [current_period]
+    previous_period = c2.selectbox('Karşılaştırma Dönemi', previous_candidates, index=max(0, len(previous_candidates)-1), key='previous_period_select')
+
+    if st.button('Ana Analizi Çalıştır', use_container_width=True):
+        with st.spinner('Analiz hazırlanıyor...'):
+            st.session_state.main_result = run_main_analysis(
+                st.session_state.tb_df, st.session_state.plcc_df, current_period=current_period, previous_period=previous_period
+            )
+        st.success('Ana analiz hazırlandı.')
+
+    result = st.session_state.get('main_result') or {}
+    if result:
+        st.info(f"Dönemler: {', '.join(result['adapter'].available_periods)}")
+
+
+def page_analysis():
+    result = st.session_state.get('main_result') or {}
+    if not result:
+        st.warning('Önce Dashboard ekranında ana analizi çalıştırın.')
+        return
+
+    tabs = st.tabs(['TB', 'PL-CC Detay', 'PL-CC Alt Toplam', 'Bilanço', 'Gelir Tablosu'])
+
+    datasets = [
+        ('tb_rows', 'tb_export'),
+        ('plcc_detail', 'plcc_detail_export'),
+        ('plcc_subtotal', 'plcc_subtotal_export'),
+        ('balance_df', 'balance_export'),
+        ('income_df', 'income_export'),
+    ]
+
+    for tab, (data_key, dl_key) in zip(tabs, datasets):
+        with tab:
+            df = result.get(data_key, pd.DataFrame()).copy()
+            q = st.text_input('Ara', key=f'search_{data_key}')
+            if q and not df.empty:
+                mask = LEGACY.df_text_search_mask(df, list(df.columns), q)
+                df = df[mask]
+            st.dataframe(df, use_container_width=True, height=560)
+            download_df_button(df, 'Excel İndir', f'{data_key}.xlsx', dl_key)
+
+
+def page_notes():
+    st.header('Not Tanımları')
+    notes = storage.load_notes(ROOT)
+
+    with st.form('add_note_form', clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        hesap = c1.text_input('Hesap')
+        ana_hesap = c2.text_input('Ana Hesap (opsiyonel)')
+        masraf = c3.text_input('Masraf Yeri (opsiyonel)')
+        note_tr = st.text_area('Not (TR)')
+        note_en = st.text_area('Not (EN)')
+        submitted = st.form_submit_button('Kaydet', use_container_width=True)
+    if submitted:
+        notes.append({
+            'hesap': hesap.strip(),
+            'anaHesap': ana_hesap.strip(),
+            'masrafYeri': masraf.strip(),
+            'not': note_tr.strip(),
+            'noteEn': note_en.strip() or note_tr.strip(),
+        })
+        storage.save_notes(ROOT, notes)
+        st.success('Not kaydedildi.')
+        st.rerun()
+
+    df = pd.DataFrame(notes)
+    st.dataframe(df, use_container_width=True, height=420)
+    if not df.empty:
+        idx = st.number_input('Silinecek satır index', min_value=0, max_value=len(df)-1, step=1)
+        if st.button('Seçili Notu Sil', use_container_width=True):
+            notes.pop(int(idx))
+            storage.save_notes(ROOT, notes)
+            st.success('Not silindi.')
+            st.rerun()
+
+
+def page_responsibles():
+    st.header('Sorumlu Tayin')
+    items = storage.load_responsibles(ROOT)
+
+    with st.form('add_resp_form', clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        hesap = c1.text_input('Hesap')
+        ana_hesap = c2.text_input('Ana Hesap (opsiyonel)')
+        sorumlu = c3.text_input('Sorumlu')
+        submitted = st.form_submit_button('Kaydet', use_container_width=True)
+    if submitted:
+        items.append({
+            'hesap': hesap.strip(),
+            'anaHesap': ana_hesap.strip(),
+            'sorumlu': sorumlu.strip(),
+        })
+        storage.save_responsibles(ROOT, items)
+        st.success('Sorumlu kaydedildi.')
+        st.rerun()
+
+    st.subheader('Toplu Yapıştır')
+    bulk_text = st.text_area('Hesap\tSorumlu veya Hesap\tAnaHesap\tSorumlu', height=160)
+    if st.button('Toplu Kaydet', use_container_width=True):
+        parsed = []
+        for line in bulk_text.splitlines():
+            parts = [p.strip() for p in line.split('\t')]
+            if len(parts) == 2 and parts[0]:
+                parsed.append({'hesap': parts[0], 'anaHesap': '', 'sorumlu': parts[1]})
+            elif len(parts) >= 3 and parts[0]:
+                parsed.append({'hesap': parts[0], 'anaHesap': parts[1], 'sorumlu': parts[2]})
+        if parsed:
+            items.extend(parsed)
+            storage.save_responsibles(ROOT, items)
+            st.success(f'{len(parsed)} kayıt eklendi.')
+            st.rerun()
+
+    df = pd.DataFrame(items)
+    st.dataframe(df, use_container_width=True, height=420)
+    if not df.empty:
+        idx = st.number_input('Silinecek sorumlu index', min_value=0, max_value=len(df)-1, step=1, key='resp_delete_idx')
+        if st.button('Seçili Sorumluyu Sil', use_container_width=True):
+            items.pop(int(idx))
+            storage.save_responsibles(ROOT, items)
+            st.success('Kayıt silindi.')
+            st.rerun()
+
+
+def page_muavin():
+    st.header('Muavin Analiz')
+    uploaded_files = st.file_uploader('Muavin kaynak dosyaları', type=['xlsx', 'xls'], accept_multiple_files=True, key='muavin_files')
+    if uploaded_files:
+        if st.button('Kolonları Oku', use_container_width=True):
+            with st.spinner('Kolonlar okunuyor...'):
+                st.session_state.muavin_headers = load_muavin_headers(uploaded_files)
+            st.success('Kolonlar yüklendi.')
+
+    headers_payload = st.session_state.get('muavin_headers') or {}
+    available_columns = headers_payload.get('available_columns', [])
+    mapping = {}
+    if available_columns:
+        st.subheader('Kolon Eşleme')
+        for fd in get_muavin_field_definitions():
+            opts = [''] + available_columns
+            default_idx = 0
+            auto_match = next((i for i, col in enumerate(opts) if col.strip().lower() == fd['label'].strip().lower()), 0)
+            mapping[fd['key']] = st.selectbox(
+                f"{fd['label']}{' *' if fd['required'] else ''}",
+                opts,
+                index=auto_match,
+                key=f"muavin_map_{fd['key']}"
+            )
+
+        if st.button('Muavin Analizini Çalıştır', use_container_width=True):
+            with st.spinner('Muavin analizi hazırlanıyor...'):
+                st.session_state.muavin_payload = run_muavin_analysis(uploaded_files, mapping)
+            st.success('Muavin analiz sonuçları hazır.')
+
+    payload = st.session_state.get('muavin_payload') or {}
+    tables = payload.get('tables') or {}
+    if tables:
+        tab_names = [
+            ('findings', 'Bulgu Özeti'),
+            ('period', 'Dönem'),
+            ('doctype', 'Belge Türü'),
+            ('risk_user', 'Risk / Kullanıcı'),
+            ('user', 'Kullanıcı'),
+            ('contra', 'Karşı Hesap'),
+            ('text', 'Metin / İçerik'),
+            ('account_doc_relation', 'Hesap-Belge İlişkisi'),
+            ('cost', 'Masraf Yeri'),
+            ('dupref', 'Mükerrer Ref'),
+            ('tax_projection', 'Vergi Projeksiyon'),
+            ('tax_indicator', 'Vergi Göstergesi'),
+            ('late7', '7 Gün'),
+            ('doccheck', 'Belge Kontrol'),
+            ('duprefdetail', 'Mükerrer Ref Detay'),
+            ('taxref', 'Vergi Risk'),
+            ('drilldown', 'Drilldown'),
+        ]
+        tabs = st.tabs([label for _, label in tab_names])
+        for tab, (key, label) in zip(tabs, tab_names):
+            with tab:
+                df = tables.get(key, pd.DataFrame()).copy()
+                q = st.text_input(f'{label} içinde ara', key=f'muavin_search_{key}')
+                if q and not df.empty:
+                    mask = LEGACY.df_text_search_mask(df, list(df.columns), q)
+                    df = df[mask]
+                st.dataframe(df, use_container_width=True, height=560)
+                download_df_button(df, 'Excel İndir', f'muavin_{key}.xlsx', f'muavin_dl_{key}')
+
+
+def page_regular_ft():
+    st.header('Düzenli Gelen Fatura Analizi')
+    c1, c2, c3 = st.columns(3)
+    faggl_file = c1.file_uploader('FAGGL', type=['xlsx', 'xls'], key='faggl')
+    eba_file = c2.file_uploader('EBA', type=['xlsx', 'xls'], key='eba')
+    zfi_file = c3.file_uploader('ZFI052', type=['xlsx', 'xls'], key='zfi')
+
+    if st.button('Düzenli Gelen Fatura Analizini Çalıştır', use_container_width=True):
+        if faggl_file is None or eba_file is None or zfi_file is None:
+            st.warning('Üç dosya da yüklenmelidir.')
+        else:
+            with st.spinner('Analiz hazırlanıyor...'):
+                st.session_state.regular_ft_payload = run_regular_ft_analysis(
+                    uploaded_file_to_df(faggl_file),
+                    uploaded_file_to_df(eba_file),
+                    uploaded_file_to_df(zfi_file),
+                )
+            st.success('Analiz hazır.')
+
+    payload = st.session_state.get('regular_ft_payload') or {}
+    df = payload.get('output_df', pd.DataFrame()).copy()
+    if not df.empty:
+        q = st.text_input('Tabloda ara', key='regular_ft_search')
+        if q:
+            mask = LEGACY.df_text_search_mask(df, list(df.columns), q)
+            df = df[mask]
+        st.dataframe(df, use_container_width=True, height=560)
+        download_df_button(df, 'Excel İndir', 'regular_ft.xlsx', 'regular_ft_dl')
+
+
+def page_user_management():
+    st.header('Kullanıcı Yönetimi')
+    users = storage.load_users(ROOT)
+    df = pd.DataFrame(users)
+    st.dataframe(df, use_container_width=True, height=320)
+
+    with st.form('user_form', clear_on_submit=True):
+        username = st.text_input('Kullanıcı Adı')
+        password = st.text_input('Şifre', type='password')
+        is_admin = st.checkbox('Admin')
+        st.caption('İzinler')
+        cols = st.columns(3)
+        permissions = {}
+        keys = list(DEFAULT_PERMISSIONS.keys())
+        for i, key in enumerate(keys):
+            with cols[i % 3]:
+                permissions[key] = st.checkbox(key, value=DEFAULT_PERMISSIONS[key], key=f'perm_{key}')
+        submitted = st.form_submit_button('Kullanıcı Kaydet / Güncelle', use_container_width=True)
+    if submitted:
+        payload = {
+            'username': username.strip(),
+            'password_hash': storage.sha256_text(password.strip()) if password.strip() else '',
+            'is_admin': bool(is_admin),
+            'permissions': permissions,
+        }
+        if not payload['password_hash']:
+            existing = next((u for u in users if str(u.get('username', '')).strip().lower() == payload['username'].lower()), None)
+            if existing:
+                payload['password_hash'] = existing.get('password_hash', '')
+        auth.upsert_user(ROOT, payload, DEFAULT_PERMISSIONS)
+        st.success('Kullanıcı kaydedildi.')
+        st.rerun()
+
+    delete_name = st.text_input('Silinecek kullanıcı adı')
+    if st.button('Kullanıcıyı Sil', use_container_width=True):
+        try:
+            auth.delete_user(ROOT, delete_name)
+            st.success('Kullanıcı silindi.')
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+
+def main():
+    init_state()
+    if not st.session_state.logged_in:
+        login_page()
+        return
+
+    page = sidebar()
+    if page == 'Dashboard':
+        page_dashboard()
+    elif page == 'Analiz':
+        page_analysis()
+    elif page == 'Not Tanımları':
+        page_notes()
+    elif page == 'Sorumlu Tayin':
+        page_responsibles()
+    elif page == 'Muavin Analiz':
+        page_muavin()
+    elif page == 'Düzenli Gelen Ft':
+        page_regular_ft()
+    elif page == 'Kullanıcı Yönetimi':
+        page_user_management()
+
+
+if __name__ == '__main__':
+    main()
